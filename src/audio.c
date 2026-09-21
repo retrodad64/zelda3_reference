@@ -134,8 +134,24 @@ static const uint8 kVolumeTransitionStep[4] = { 7, 3, 3, 24};
 static float kVolumeTransitionStepFloat[4];
 static float kVolumeTransitionTargetFloat[4];
 
+bool g_cheat_no_music;
+
+// 0xF1 is the fade out the game itself uses to end a track. Turning every track request into
+// one keeps both the SPC and the MSU player quiet through their normal paths.
+void ZeldaToggleMusic(void) {
+  g_cheat_no_music = !g_cheat_no_music;
+  if (g_cheat_no_music)
+    ZeldaPlayMsuAudioTrack(0xf1);
+  else if (music_unk1 != 0 && music_unk1 < 0xf0)
+    ZeldaPlayMsuAudioTrack(music_unk1);
+}
+
 void ZeldaPlayMsuAudioTrack(uint8 music_ctrl) {
   MsuPlayer *mp = &g_msu_player;
+
+  if (g_cheat_no_music && (music_ctrl & 0xf0) != 0xf0)
+    music_ctrl = 0xf1;
+
   if (!mp->enabled) {
     mp->resume_info.tag = 0;
     zelda_apu_write(APUI00, music_ctrl);

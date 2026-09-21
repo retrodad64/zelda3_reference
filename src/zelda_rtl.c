@@ -264,7 +264,7 @@ static void ZeldaRunGameLoop() {
 
 void ZeldaInitialize() {
   g_zenv.dma = dma_init(NULL);
-  g_zenv.ppu = ppu_init(NULL);
+  g_zenv.ppu = ppu_init();
   g_zenv.ram = g_ram;
   g_zenv.sram = (uint8*)calloc(8192, 1);
   g_zenv.vram = g_zenv.ppu->vram;
@@ -791,6 +791,21 @@ static const char *const kReferenceSaves[] = {
   "Chapter 13 - After Ganon's Tower.sav",
 };
 
+// Same as SaveLoadSlot but for a path given by the caller. Returns false if the file would not open.
+bool SaveLoadFile(int cmd, const char *filename) {
+  FILE *f = fopen(filename, cmd != kSaveLoad_Save ? "rb" : "wb");
+  if (!f)
+    return false;
+  printf("*** %s '%s'\n",
+    cmd == kSaveLoad_Save ? "Saving" : cmd == kSaveLoad_Load ? "Loading" : "Replaying", filename);
+  if (cmd != kSaveLoad_Save)
+    StateRecorder_Load(&state_recorder, f, cmd == kSaveLoad_Replay);
+  else
+    StateRecorder_Save(&state_recorder, f);
+  fclose(f);
+  return true;
+}
+
 void SaveLoadSlot(int cmd, int which) {
   char name[128];
   if (which & 256) {
@@ -857,6 +872,8 @@ void PatchCommand(char c) {
     StateRecoderMultiPatch_Patch(&mp, 0xf361, rupees >> 8);  // link_rupees_goal
   } else if (c == 'k') {
     StateRecorder_ClearKeyLog(&state_recorder);
+  } else if (c == 'f') {
+    StateRecoderMultiPatch_Patch(&mp, 0xf356, 1);  // link_item_flippers
   } else if (c == 'o') {
     StateRecoderMultiPatch_Patch(&mp, 0xf36f, 1);
   } else if (c == 'l') {

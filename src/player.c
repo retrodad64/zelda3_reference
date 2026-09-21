@@ -122,6 +122,8 @@ void CacheCameraProperties() {  // 81ff28
   dung_cur_floor_cached = dung_cur_floor;
 }
 
+bool g_cheat_invincible;
+
 void CheckAbilityToSwim() {  // 81ffb6
   if (!link_is_bunny_mirror && link_item_flippers)
     return;
@@ -147,7 +149,7 @@ void Link_Main() {  // 878000
 
 void Link_ControlHandler() {  // 87807f
   if (link_give_damage) {
-    if (link_cape_mode) {
+    if (link_cape_mode || g_cheat_invincible) {
       link_give_damage = 0;
       link_auxiliary_state = 0;
       link_incapacitated_timer = 0;
@@ -1567,6 +1569,9 @@ void HandleLayerOfDestination() {  // 8794f1
 
 void DungeonPitDoDamage() {  // 879502
   submodule_index = 20;
+  if (g_cheat_invincible)
+    return;
+
   link_health_current -= 8;
   if (link_health_current >= 0xa8)
     link_health_current = 0;

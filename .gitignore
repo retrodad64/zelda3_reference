@@ -31,3 +31,10 @@ __pycache__
 /sprites-gfx
 /glsl-shaders
 /token.txt
+/zelda3_debug.log
+/zelda3_tiles_*.png
+/zelda3_anim_*.png
+/.zdrive.*.keys
+/runs/
+/zelda3_room_*.txt
+/zelda3_frame_*.png

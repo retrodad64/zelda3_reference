@@ -23,9 +23,17 @@
 
 #include "config.h"
 #include "assets.h"
+#include "messaging.h"
+#include "select_file.h"
 #include "load_gfx.h"
 #include "util.h"
 #include "audio.h"
+#include "debug_log.h"
+#include "png_writer.h"
+#include "debug_goto.h"
+#include "debug_scene.h"
+#include "player.h"
+#include "debug_locate.h"
 
 static bool g_run_without_emu = 0;
 
@@ -144,6 +152,40 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
   return SDL_HITTEST_NORMAL;
 }
 
+// Shift+S, or "screenshot" in a key script. Written from the frame the renderer just drew,
+// so it is exactly what is on screen, message boxes and all.
+static bool g_want_screenshot;
+static int g_screenshot_counter;
+
+static void SaveScreenshot(const uint8 *pixels, int pitch, int width, int height) {
+  uint8 *rgb = malloc((size_t)width * height * 3);
+  char name[64];
+
+  if (rgb == NULL)
+    return;
+
+  // The texture is ARGB8888, so each pixel is four bytes with the blue one first in memory.
+  for (int y = 0; y < height; y++) {
+    const uint8 *src = pixels + (size_t)y * pitch;
+    uint8 *dst = rgb + (size_t)y * width * 3;
+
+    for (int x = 0; x < width; x++, src += 4, dst += 3) {
+      dst[0] = src[2];
+      dst[1] = src[1];
+      dst[2] = src[0];
+    }
+  }
+
+  snprintf(name, sizeof(name), "zelda3_frame_%04d.png", ++g_screenshot_counter);
+
+  if (WritePng(name, width, height, rgb))
+    printf("wrote %s (%dx%d)\n", name, width, height);
+  else
+    fprintf(stderr, "could not write %s\n", name);
+
+  free(rgb);
+}
+
 static void DrawPpuFrameWithPerf() {
   int render_scale = PpuGetCurrentRenderScale(g_zenv.ppu, g_ppu_render_flags);
   uint8 *pixel_buffer = 0;
@@ -168,6 +210,14 @@ static void DrawPpuFrameWithPerf() {
   }
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
+  DebugGoto_DrawOverlay(pixel_buffer, pitch, render_scale);
+
+  if (g_want_screenshot) {
+    g_want_screenshot = false;
+    SaveScreenshot(pixel_buffer, pitch, g_snes_width * render_scale,
+                   g_snes_height * render_scale);
+  }
+
   g_renderer_funcs.EndDraw();
 }
 
@@ -277,8 +327,376 @@ static const struct RendererFuncs kSdlRendererFuncs  = {
 void OpenGLRenderer_Create(struct RendererFuncs *funcs, bool use_opengl_es);
 
 #undef main
+// --keys: drive the game from a script of key presses, so a run can be repeated exactly and
+// without a person at the keyboard. Events go through HandleCommand, the same path a real key
+// takes, which is what makes a held command like LogAnimation work.
+static void HandleCommand(uint32 j, bool pressed);
+
+typedef struct KeyScriptEvent {
+  uint32 frame;
+  uint16 cmd;
+  uint8  pressed;
+} KeyScriptEvent;
+
+static KeyScriptEvent *g_key_script;
+static int g_key_script_len;
+static int g_key_script_cap;
+static int g_key_script_pos;
+static uint32 g_key_script_frame;
+
+// --quit-after: stop after this many frames, so a scripted run ends on its own.
+static uint32 g_quit_after;
+
+// The names a script may use. The joypad comes first, in the order the ini lists it, and the
+// rest are the command names from that same file.
+typedef struct KeyScriptName {
+  const char *name;
+  uint16      cmd;
+} KeyScriptName;
+
+static const KeyScriptName kKeyScriptNames[] = {
+  {"up",     kKeys_Controls + 0},
+  {"down",   kKeys_Controls + 1},
+  {"left",   kKeys_Controls + 2},
+  {"right",  kKeys_Controls + 3},
+  {"select", kKeys_Controls + 4},
+  {"start",  kKeys_Controls + 5},
+  {"a",      kKeys_Controls + 6},
+  {"b",      kKeys_Controls + 7},
+  {"x",      kKeys_Controls + 8},
+  {"y",      kKeys_Controls + 9},
+  {"l",      kKeys_Controls + 10},
+  {"r",      kKeys_Controls + 11},
+  {"logtiles",      kKeys_LogTiles},
+  {"loganimation",  kKeys_LogAnimation},
+  {"gotoscreen",    kKeys_GotoScreen},
+  {"cheatlife",     kKeys_CheatLife},
+  {"cheatequipment", kKeys_CheatEquipment},
+  {"walkthroughwalls", kKeys_CheatWalkThroughWalls},
+  {"invincible",    kKeys_CheatInvincible},
+  {"nomusic",       kKeys_NoMusic},
+  {"listsprites",   kKeys_ListSprites},
+  {"screenshot",    kKeys_Screenshot},
+  {"copylocation",  kKeys_CopyLocation},
+  {"pause",         kKeys_Pause},
+  {"turbo",         kKeys_Turbo},
+};
+
+static bool KeyScript_Lookup(const char *name, uint16 *out) {
+  for (size_t i = 0; i < countof(kKeyScriptNames); i++) {
+    if (strcasecmp(kKeyScriptNames[i].name, name) == 0) {
+      *out = kKeyScriptNames[i].cmd;
+      return true;
+    }
+  }
+
+  // Savestate slots, written the way the ini writes them: Load1 through Load10.
+  int slot = 0;
+
+  if (sscanf(name, "load%d", &slot) == 1 && slot >= 1 && slot <= 10) {
+    *out = (uint16)(kKeys_Load + slot - 1);
+    return true;
+  }
+
+  if (sscanf(name, "save%d", &slot) == 1 && slot >= 1 && slot <= 10) {
+    *out = (uint16)(kKeys_Save + slot - 1);
+    return true;
+  }
+
+  return false;
+}
+
+static void KeyScript_Add(uint32 frame, uint16 cmd, bool pressed) {
+  if (g_key_script_len == g_key_script_cap) {
+    g_key_script_cap = g_key_script_cap ? g_key_script_cap * 2 : 64;
+    g_key_script = realloc(g_key_script, g_key_script_cap * sizeof(*g_key_script));
+  }
+
+  g_key_script[g_key_script_len].frame = frame;
+  g_key_script[g_key_script_len].cmd = cmd;
+  g_key_script[g_key_script_len].pressed = pressed;
+  g_key_script_len++;
+}
+
+// Read a script. One statement per line, acted on in order:
+//
+//   wait <frames>          nothing happens for this long
+//   tap <name>             press and release, two frames
+//   hold <name> <frames>   press, wait, release
+//
+// Blank lines and anything after a # are ignored. A bad line stops the program, because a
+// script that half ran would be worse than one that did not run at all.
+static void KeyScript_Load(const char *path) {
+  FILE *f = fopen(path, "r");
+
+  if (f == NULL) {
+    fprintf(stderr, "Unable to open key script '%s'\n", path);
+    exit(1);
+  }
+
+  char line[256];
+  uint32 at = 0;
+  int lineno = 0;
+
+  while (fgets(line, sizeof(line), f)) {
+    lineno++;
+
+    char *hash = strchr(line, '#');
+
+    if (hash)
+      *hash = '\0';
+
+    char verb[64], name[64];
+    int frames = 0;
+
+    if (sscanf(line, "%63s %63s %d", verb, name, &frames) >= 1) {
+      uint16 cmd = 0;
+
+      if (strcasecmp(verb, "wait") == 0 && sscanf(line, "%63s %d", verb, &frames) == 2 &&
+          frames > 0) {
+        at += (uint32)frames;
+        continue;
+      }
+
+      if (strcasecmp(verb, "tap") == 0 && KeyScript_Lookup(name, &cmd)) {
+        KeyScript_Add(at, cmd, true);
+        KeyScript_Add(at + 2, cmd, false);
+        at += 2;
+        continue;
+      }
+
+      if (strcasecmp(verb, "hold") == 0 && frames > 0 && KeyScript_Lookup(name, &cmd)) {
+        KeyScript_Add(at, cmd, true);
+        KeyScript_Add(at + (uint32)frames, cmd, false);
+        at += (uint32)frames;
+        continue;
+      }
+
+      // press and release take no time, so two of them can bracket other actions. That is the
+      // only way to capture an animation that a button press starts, because the logging key
+      // has to already be down when the button goes in.
+      if (strcasecmp(verb, "press") == 0 && KeyScript_Lookup(name, &cmd)) {
+        KeyScript_Add(at, cmd, true);
+        continue;
+      }
+
+      if (strcasecmp(verb, "release") == 0 && KeyScript_Lookup(name, &cmd)) {
+        KeyScript_Add(at, cmd, false);
+        continue;
+      }
+
+      fprintf(stderr, "%s:%d: cannot read '%s'\n", path, lineno, verb);
+      fclose(f);
+      exit(1);
+    }
+  }
+
+  fclose(f);
+  printf("*** Key script '%s': %d events over %u frames\n", path, g_key_script_len, at);
+}
+
+// Fire everything the script has due this frame, then move its clock on.
+// True while something asked for on the command line still hasn't happened. The script clock is
+// held at zero until this clears, so a script's frame numbers mean the same thing every run no
+// matter how long a save load or an intro skip took.
+static bool KeyScript_SetupPending(void);
+
+// Frames to let the game settle after the last of that lands. A jump ends with the screen blanked
+// and the submodule stepped, and the following frame is what undoes both.
+enum { kKeyScriptSettleFrames = 4 };
+
+static int g_key_script_settle;
+
+static void KeyScript_RunFrame(void) {
+  if (KeyScript_SetupPending()) {
+    g_key_script_settle = kKeyScriptSettleFrames;
+    return;
+  }
+
+  if (g_key_script_settle > 0) {
+    g_key_script_settle--;
+    return;
+  }
+
+  if (g_key_script_frame == 0)
+    printf("*** Key script starts now\n");
+
+  while (g_key_script_pos < g_key_script_len &&
+         g_key_script[g_key_script_pos].frame <= g_key_script_frame) {
+    HandleCommand(g_key_script[g_key_script_pos].cmd,
+                  g_key_script[g_key_script_pos].pressed != 0);
+    g_key_script_pos++;
+  }
+
+  g_key_script_frame++;
+}
+
+// --skip-intro: start a fresh file straight away instead of sitting through the title, the
+// attract loop and the file select. Set from the command line, acted on once the first frame
+// has run, because the game only initialises itself on that frame.
+static bool g_skip_intro;
+
+// --load-save <file>: load a savestate once the first frame has run. Same thing the F1 to F10
+// keys do, but for any path. Relative paths resolve from the directory holding zelda3.ini.
+static const char *g_load_save_path;
+
+// --screen-id <hex>: jump to an overworld screen once the game gets there. It waits rather than
+// firing on a fixed frame, because a save load and an intro skip take different amounts of time.
+// --enemy-warp, --npc-warp, --boss-warp. Held until the overworld is up, like the screen jump.
+static int g_warp_type = -1;
+static bool g_list_sprites;
+static bool g_list_liftables;
+
+// --lift-warp [hex]: stand Link beside something he can pick up. It runs after any screen
+// jump, so the jump chooses the area and this chooses the spot inside it.
+static int g_lift_warp = -2;
+
+// --entrance <hex>: go through a door without having to find it. The game is dropped into
+// the falling entrance module, which loads the room the same way walking in does.
+static int g_entrance = -1;
+
+// --dump-room-objects <n>: print what one room is built from, then carry on.
+static int g_dump_room_objects = -1;
+static bool g_dump_rooms;
+// --no-music: start with the music off, so an unattended run is quiet.
+static bool g_start_muted;
+
+// --invincible: turn the damage cheat on before the first frame, for a run that is not about
+// combat and should not end because something wandered into Link.
+static bool g_start_invincible;
+
+// --give-flippers: put the flippers in Link's kit once the game is running, so a save made
+// for testing deep water does not have to be played up to the Zora first.
+static bool g_give_flippers;
+static int g_warp_category;
+
+// Options that all decide where Link ends up. Naming two of them is a mistake worth stopping for,
+// so the first one claims the slot and the second one fails. Add to this as new options arrive.
+static const char *g_position_option;
+
+static void ClaimPositionOption(const char *name) {
+  if (g_position_option != NULL) {
+    fprintf(stderr, "%s cannot be used with %s, they both decide where Link ends up\n",
+            name, g_position_option);
+    exit(1);
+  }
+  g_position_option = name;
+}
+
+static int g_screen_id = -1;
+static int g_screen_id_waited;
+static int g_goto_x = -1;
+static int g_goto_y = -1;
+static bool g_goto_dark;
+
+static bool KeyScript_SetupPending(void) {
+  return g_load_save_path != NULL || g_skip_intro || g_screen_id >= 0 || g_goto_x >= 0 ||
+         g_warp_type >= 0 || g_list_liftables || g_lift_warp != -2 || g_entrance >= 0 ||
+         DebugScene_Pending();
+}
+
+// Start file one on a brand new save, the way picking an empty slot and naming it does.
+//
+// The steps are lifted from NameFile_EraseSave and the tail of NameFile_DoTheNaming in
+// select_file.c, which is the game's own new-file path, and then CopySaveToWRAM, which is what
+// choosing a file on the select screen calls. That lands in module 5, the file loader, which
+// puts Link in his house with his uncle already gone.
+static void SkipIntroToNewGame(void) {
+  static const uint8 kSramInit_Normal[60] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0,    0, 0, 0,    0,    0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,    0, 0, 0,    0,    0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,    0, 0, 0, 0x18, 0x18, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf8, 0, 0,
+  };
+
+  const int slot = 0;
+  uint8 *sram = &g_zenv.sram[slot * 0x500];
+
+  memset(sram, 0, 0x500);
+
+  // Six blanks for the name, which is what the naming screen starts with.
+  uint16 *name = (uint16 *)(sram + kSrmOffs_Name);
+  for (int i = 0; i < 6; i++)
+    name[i] = 0xa9;
+
+  WORD(sram[0x3e5]) = 0x55aa;
+  WORD(sram[0x20c]) = 0xf000;
+  WORD(sram[0x20e]) = 0xf000;
+  WORD(sram[kSrmOffs_DiedCounter]) = 0xffff;
+  memcpy(sram + 0x340, kSramInit_Normal, 60);
+  Intro_FixCksum(sram);
+
+  srm_var1 = slot * 2 + 2;
+  WORD(g_ram[0]) = slot * 0x500;
+  CopySaveToWRAM();
+
+  // Skip the opening as well. Module_PreDungeon only tucks Link into bed, which is what starts
+  // the long telepathy from Zelda, while this flag is clear, so setting it lands him standing
+  // in the house with nothing to read through. It is set in RAM rather than in the save block
+  // because CopySaveToWRAM has just copied the one to the other.
+  sram_progress_flags |= 0x10;
+}
+
+
+// Everything the argument parsing below accepts. Keep this in step with it: a flag that is
+// parsed but not listed here is a flag nobody finds.
+static void PrintUsage(void) {
+  static const char *kUsage[] = {
+    "zelda3 [options] [rom]",
+    "",
+    "A bare path is a ROM for the reference emulator. The game itself runs from",
+    "zelda3_assets.dat and does not need one.",
+    "",
+    "Setup",
+    "  --config <file>        Read settings from this file. Must come first, and",
+    "                         stops the search for zelda3.ini.",
+    "  --skip-intro           Start a new file in Link's house.",
+    "  --load-save <file>     Load a savestate, the files F1 to F10 use.",
+    "",
+    "Going somewhere. Only one of these at a time.",
+    "  --screen-id <hex>      Overworld screen, 00 to 7F.",
+    "  --goto <x,y>           An exact world position.",
+    "  --entrance <hex>       Entrance number, 00 to FF.",
+    "  --enemy-warp <hex>     Beside the first sprite of that type.",
+    "  --npc-warp <hex>       The same, for a harmless sprite.",
+    "  --boss-warp <hex>      The same, for a high health sprite.",
+    "  --lift-warp [<hex>]    Beside a liftable cell. Without a value, any.",
+    "  --scene <file>         Rebuild a scene saved by the pug hero entity sandbox.",
+    "",
+    "Listing and dumping",
+    "  --list-sprites         Every sprite the overworld data places.",
+    "  --list-liftables       Every liftable cell on the current screen.",
+    "  --dump-rooms           Hazard tile counts for all 320 dungeon rooms.",
+    "  --dump-room-objects <hex>  The objects one room draws.",
+    "",
+    "Running unattended",
+    "  --keys <file>          Play from a key script.",
+    "  --quit-after <n>       Exit cleanly after this many frames.",
+    "  --no-music             Start with the music off.",
+    "  --invincible           Start with the invincible cheat on.",
+    "  --give-flippers        Put the flippers in Link's kit once the save has loaded.",
+    "",
+    "  --help                 This list.",
+    "",
+    "Keys are not set here. They live in the [KeyMap] section of zelda3.ini.",
+    "command_line.md has the detail.",
+  };
+
+  for (size_t i = 0; i < countof(kUsage); i++) {
+    printf("%s\n", kUsage[i]);
+  }
+}
+
 int main(int argc, char** argv) {
   argc--, argv++;
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      PrintUsage();
+      return 0;
+    }
+  }
+
   const char *config_file = NULL;
   if (argc >= 2 && strcmp(argv[0], "--config") == 0) {
     config_file = argv[1];
@@ -286,11 +704,317 @@ int main(int argc, char** argv) {
   } else {
     SwitchDirectory();
   }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--keys") == 0 && i + 1 < argc) {
+      KeyScript_Load(argv[i + 1]);
+      memmove(argv + i, argv + i + 2, (argc - i - 2) * sizeof(*argv));
+      argc -= 2;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--quit-after") == 0 && i + 1 < argc) {
+      g_quit_after = (uint32)strtoul(argv[i + 1], NULL, 10);
+      memmove(argv + i, argv + i + 2, (argc - i - 2) * sizeof(*argv));
+      argc -= 2;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--skip-intro") == 0) {
+      g_skip_intro = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    int taken = 0;
+    if (strncmp(argv[i], "--load-save=", 12) == 0) {
+      g_load_save_path = argv[i] + 12;
+      taken = 1;
+    } else if (strcmp(argv[i], "--load-save") == 0) {
+      if (i + 1 >= argc)
+        Die("--load-save needs a file name");
+      g_load_save_path = argv[i + 1];
+      taken = 2;
+    }
+    if (taken) {
+      // Fail now rather than after the window is up, so a typo is obvious.
+      FILE *f = fopen(g_load_save_path, "rb");
+      if (!f) {
+        fprintf(stderr, "Unable to open save file '%s'\n", g_load_save_path);
+        exit(1);
+      }
+      fclose(f);
+      memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+      argc -= taken;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    const char *value = NULL;
+    int taken = 0;
+    if (strncmp(argv[i], "--screen-id=", 12) == 0) {
+      value = argv[i] + 12;
+      taken = 1;
+    } else if (strcmp(argv[i], "--screen-id") == 0) {
+      if (i + 1 >= argc)
+        Die("--screen-id needs a screen number");
+      value = argv[i + 1];
+      taken = 2;
+    }
+    if (taken) {
+      char *end = NULL;
+      long id = strtol(value, &end, 16);
+      if (end == value || *end != 0 || id < 0 || id > 0x7f) {
+        fprintf(stderr, "--screen-id wants an overworld screen in hex, 00 to 7F, got '%s'\n", value);
+        exit(1);
+      }
+      ClaimPositionOption("--screen-id");
+      g_screen_id = (int)id;
+      memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+      argc -= taken;
+      break;
+    }
+  }
+
+  // --enemy-warp, --npc-warp and --boss-warp all take a sprite type in hex. They do the same
+  // search, and the category only decides the warning when the id is not the kind you named.
+  static const struct { const char *flag; int category; } kWarpFlags[] = {
+    {"--enemy-warp", kLocateCategory_Enemy},
+    {"--npc-warp",   kLocateCategory_Npc},
+    {"--boss-warp",  kLocateCategory_Boss},
+  };
+
+  for (size_t w = 0; w < countof(kWarpFlags); w++) {
+    size_t flaglen = strlen(kWarpFlags[w].flag);
+
+    for (int i = 0; i < argc; i++) {
+      const char *value = NULL;
+      int taken = 0;
+      if (strncmp(argv[i], kWarpFlags[w].flag, flaglen) == 0 && argv[i][flaglen] == '=') {
+        value = argv[i] + flaglen + 1;
+        taken = 1;
+      } else if (strcmp(argv[i], kWarpFlags[w].flag) == 0) {
+        if (i + 1 >= argc)
+          Die("warp flag needs a sprite type");
+        value = argv[i + 1];
+        taken = 2;
+      }
+      if (taken) {
+        char *end = NULL;
+        long id = strtol(value, &end, 16);
+        if (end == value || *end != 0 || id < 0 || id > 0xf2) {
+          fprintf(stderr, "%s wants a sprite type in hex, 00 to F2, got '%s'\n",
+                  kWarpFlags[w].flag, value);
+          exit(1);
+        }
+        ClaimPositionOption(kWarpFlags[w].flag);
+        g_warp_type = (int)id;
+        g_warp_category = kWarpFlags[w].category;
+        memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+        argc -= taken;
+        break;
+      }
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--no-music") == 0) {
+      g_start_muted = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--invincible") == 0) {
+      g_start_invincible = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--give-flippers") == 0) {
+      g_give_flippers = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+
+  // --scene: a place built in the pug demo's sandbox. It is read now, so a file that will not
+  // do stops the run before the window opens rather than after the save has loaded.
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--scene") == 0) {
+      if (i + 1 >= argc)
+        Die("--scene needs a file");
+      ClaimPositionOption("--scene");
+      if (!DebugScene_Load(argv[i + 1]))
+        exit(1);
+      memmove(argv + i, argv + i + 2, (argc - i - 2) * sizeof(*argv));
+      argc -= 2;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    const char *value = NULL;
+    int taken = 0;
+    if (strncmp(argv[i], "--lift-warp=", 12) == 0) {
+      value = argv[i] + 12;
+      taken = 1;
+    } else if (strcmp(argv[i], "--lift-warp") == 0) {
+      value = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : NULL;
+      taken = value ? 2 : 1;
+    }
+    if (taken) {
+      g_lift_warp = -1;
+      if (value) {
+        char *end = NULL;
+        long id = strtol(value, &end, 16);
+        if (end == value || *end != 0 || id < 0 || id > 0xfff) {
+          fprintf(stderr, "--lift-warp wants a map16 value in hex, got '%s'\n", value);
+          exit(1);
+        }
+        g_lift_warp = (int)id;
+      }
+      memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+      argc -= taken;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    const char *value = NULL;
+    int taken = 0;
+    if (strncmp(argv[i], "--dump-room-objects=", 20) == 0) {
+      value = argv[i] + 20;
+      taken = 1;
+    } else if (strcmp(argv[i], "--dump-room-objects") == 0) {
+      if (i + 1 >= argc)
+        Die("--dump-room-objects needs a room number");
+      value = argv[i + 1];
+      taken = 2;
+    }
+    if (taken) {
+      g_dump_room_objects = (int)strtol(value, NULL, 10);
+      memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+      argc -= taken;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    const char *value = NULL;
+    int taken = 0;
+    if (strncmp(argv[i], "--entrance=", 11) == 0) {
+      value = argv[i] + 11;
+      taken = 1;
+    } else if (strcmp(argv[i], "--entrance") == 0) {
+      if (i + 1 >= argc)
+        Die("--entrance needs a number");
+      value = argv[i + 1];
+      taken = 2;
+    }
+    if (taken) {
+      char *end = NULL;
+      long id = strtol(value, &end, 16);
+      if (end == value || *end != 0 || id < 0 || id > 0xff) {
+        fprintf(stderr, "--entrance wants an entrance number in hex, got '%s'\n", value);
+        exit(1);
+      }
+      g_entrance = (int)id;
+      memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+      argc -= taken;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--list-liftables") == 0) {
+      g_list_liftables = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--dump-rooms") == 0) {
+      g_dump_rooms = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--list-sprites") == 0) {
+      g_list_sprites = true;
+      memmove(argv + i, argv + i + 1, (argc - i - 1) * sizeof(*argv));
+      argc--;
+      break;
+    }
+  }
+  for (int i = 0; i < argc; i++) {
+    const char *value = NULL;
+    int taken = 0;
+    if (strncmp(argv[i], "--goto=", 7) == 0) {
+      value = argv[i] + 7;
+      taken = 1;
+    } else if (strcmp(argv[i], "--goto") == 0) {
+      if (i + 1 >= argc)
+        Die("--goto needs a coordinate");
+      value = argv[i + 1];
+      taken = 2;
+    }
+    if (taken) {
+      // "x,y" is the light world and "d:x,y" the dark one. The screen falls out of the
+      // coordinate but the world does not, so it has to be said.
+      const char *cursor = value;
+      char *end = NULL;
+      long x, y;
+      bool dark = false;
+      if (cursor[0] == 'd' && cursor[1] == ':') {
+        dark = true;
+        cursor += 2;
+      }
+      x = strtol(cursor, &end, 10);
+      if (end == cursor || *end != ',')
+        goto goto_bad;
+      cursor = end + 1;
+      y = strtol(cursor, &end, 10);
+      if (end == cursor || *end != 0 || x < 0 || x > 4095 || y < 0 || y > 4095) {
+goto_bad:
+        fprintf(stderr, "--goto wants [d:]x,y in world pixels, 0 to 4095, got '%s'\n", value);
+        exit(1);
+      }
+      ClaimPositionOption("--goto");
+      g_goto_x = (int)x;
+      g_goto_y = (int)y;
+      g_goto_dark = dark;
+      memmove(argv + i, argv + i + taken, (argc - i - taken) * sizeof(*argv));
+      argc -= taken;
+      break;
+    }
+  }
   ParseConfigFile(config_file);
   LoadAssets();
   LoadLinkGraphics();
 
   ZeldaInitialize();
+
+
   g_zenv.ppu->extraLeftRight = UintMin(g_config.extended_aspect_ratio, kPpuExtraLeftRight);
   g_snes_width = (g_config.extended_aspect_ratio * 2 + 256);
   g_snes_height = (g_config.extend_y ? 240 : 224);
@@ -387,6 +1111,14 @@ int main(int argc, char** argv) {
 
   ZeldaReadSram();
 
+  if (g_start_muted)
+    ZeldaToggleMusic();
+
+  if (g_start_invincible) {
+    g_cheat_invincible = true;
+    printf("invincible on\n");
+  }
+
   for (int i = 0; i < SDL_NumJoysticks(); i++)
     OpenOneGamepad(i);
 
@@ -451,17 +1183,111 @@ int main(int argc, char** argv) {
       continue;
     }
 
+    if (g_key_script_len)
+      KeyScript_RunFrame();
+
     // Clear gamepad inputs when joypad directional inputs to avoid wonkiness
     int inputs = g_input1_state;
     if (g_input1_state & 0xf0)
       g_gamepad_buttons = 0;
     inputs |= g_gamepad_buttons;
 
+
     SDL_LockMutex(g_audio_mutex);
     bool is_replay = ZeldaRunFrame(inputs);
+
+    // One frame in, the game has initialised itself, which is the first point where dropping
+    // it straight into a game takes.
+    if (g_load_save_path) {
+      // A savestate carries the whole machine, so it replaces anything --skip-intro would set up.
+      const char *path = g_load_save_path;
+      g_load_save_path = NULL;
+      g_skip_intro = false;
+      if (!SaveLoadFile(kSaveLoad_Load, path))
+        fprintf(stderr, "Unable to open save file '%s'\n", path);
+    }
+
+    if (g_skip_intro) {
+      g_skip_intro = false;
+      SkipIntroToNewGame();
+    }
+
+    // After the save has loaded, so it is not overwritten by one that has no flippers.
+    if (g_give_flippers) {
+      g_give_flippers = false;
+      PatchCommand('f');
+      printf("flippers given\n");
+    }
+
+    // Module 9 is the overworld. Anything else means the game is still loading, or is somewhere
+    // the jump cannot reach, so give it ten seconds and then say so.
+    if (g_screen_id >= 0 || g_goto_x >= 0 || g_warp_type >= 0 || g_list_sprites || g_list_liftables || g_lift_warp != -2 ||
+        g_entrance >= 0 || g_dump_room_objects >= 0 || g_dump_rooms || DebugScene_Pending()) {
+      if (main_module_index == 9 && !player_is_indoors) {
+        if (DebugScene_Pending())
+          DebugScene_Apply();
+        if (g_goto_x >= 0)
+          DebugGoto_JumpToPoint((uint16)g_goto_x, (uint16)g_goto_y, g_goto_dark);
+        else if (g_screen_id >= 0)
+          DebugGoto_JumpTo((uint8)g_screen_id);
+        // The warp runs last, so it wins if a screen was named as well.
+        if (g_list_sprites) {
+          g_list_sprites = false;
+          DebugLocate_ListAll(g_warp_type >= 0 ? g_warp_category : kLocateCategory_Any);
+        }
+        if (g_list_liftables) {
+          g_list_liftables = false;
+          DebugLocate_ListLiftables();
+        }
+        if (g_entrance >= 0) {
+          which_entrance = (uint8)g_entrance;
+          g_entrance = -1;
+          // The falling entrance sequence loads the room and puts the player in it, which is
+          // all a look inside needs.
+          main_module_index = 0x11;
+          submodule_index = 0;
+          subsubmodule_index = 0;
+        }
+        if (g_lift_warp != -2) {
+          int wanted = g_lift_warp;
+          g_lift_warp = -2;
+          DebugLocate_WarpToLiftable(wanted);
+        }
+        if (g_dump_room_objects >= 0) {
+          int room = g_dump_room_objects;
+          g_dump_room_objects = -1;
+          DebugLocate_DumpRoomObjects(room);
+          DebugLocate_DumpRoomMap(room);
+        }
+        if (g_dump_rooms) {
+          g_dump_rooms = false;
+          DebugLocate_DumpRoomHazards();
+        }
+        if (g_warp_type >= 0)
+          DebugLocate_WarpToType((uint8)g_warp_type, g_warp_category);
+        g_screen_id = -1;
+        g_goto_x = -1;
+        g_warp_type = -1;
+      } else if (++g_screen_id_waited >= 600) {
+        fprintf(stderr, "warp or jump: never reached the overworld, ignoring\n");
+        DebugScene_Forget();
+        g_screen_id = -1;
+        g_goto_x = -1;
+        g_warp_type = -1;
+      }
+    }
+
+    DebugScene_Frame();
+
     SDL_UnlockMutex(g_audio_mutex);
 
+    DebugLog_Frame();
+
+
     frameCtr++;
+
+    if (g_quit_after && frameCtr >= g_quit_after)
+      running = false;
 
     if ((g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0) {
       continue;
@@ -510,6 +1336,7 @@ int main(int argc, char** argv) {
   g_renderer_funcs.Destroy();
 
   SDL_DestroyWindow(window);
+  DebugLog_Close();
   SDL_Quit();
   //SaveConfigFile();
   return 0;
@@ -577,6 +1404,11 @@ static void HandleCommand(uint32 j, bool pressed) {
     return;
   }
 
+  if (j == kKeys_LogAnimation) {
+    DebugLog_SetAnimationHeld(pressed);
+    return;
+  }
+
   // Everything that might access audio state
   // (like SaveLoad and Reset) must have the lock.
   SDL_LockMutex(g_audio_mutex);
@@ -592,6 +1424,27 @@ void ZeldaApuUnlock() {
   SDL_UnlockMutex(g_audio_mutex);
 }
 
+
+// Shift+L. The overworld screen and the dark world flag come from the same byte, and the
+// coordinates are Link's world position, which is what the goto and warp options take.
+static void CopyLocationToClipboard(void) {
+  char text[128];
+
+  if (player_is_indoors) {
+    snprintf(text, sizeof(text), "indoors, room %03X, coordinate (%d,%d)",
+             dungeon_room_index, link_x_coord, link_y_coord);
+  } else {
+    uint8 screen = (uint8)overworld_screen_index;
+    snprintf(text, sizeof(text), "%s world, screen %02X, coordinate (%d,%d)",
+             (screen & 0x40) ? "dark" : "light", screen, link_x_coord, link_y_coord);
+  }
+
+  if (SDL_SetClipboardText(text) != 0) {
+    fprintf(stderr, "Unable to set the clipboard: %s\n", SDL_GetError());
+  }
+
+  DebugLog_Message(text);
+}
 
 static void HandleCommand_Locked(uint32 j, bool pressed) {
   if (!pressed)
@@ -644,13 +1497,44 @@ static void HandleCommand_Locked(uint32 j, bool pressed) {
     case kKeys_ToggleRenderer: g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer; break;
     case kKeys_VolumeUp:
     case kKeys_VolumeDown: HandleVolumeAdjustment(j == kKeys_VolumeUp ? 1 : -1); break;
+    case kKeys_LogTiles: DebugLog_ToggleTileLogging(); break;
+    case kKeys_GotoScreen: DebugGoto_OpenPrompt(); break;
+    case kKeys_ListSprites: DebugLocate_ListLive(); break;
+    case kKeys_NoMusic:
+      ZeldaToggleMusic();
+      printf("music %s\n", g_cheat_no_music ? "off" : "on");
+      break;
+    case kKeys_CopyLocation: CopyLocationToClipboard(); break;
+    case kKeys_Screenshot:
+      g_want_screenshot = true;
+      break;
+    case kKeys_CheatInvincible:
+      g_cheat_invincible = !g_cheat_invincible;
+      printf("invincible %s\n", g_cheat_invincible ? "on" : "off");
+      break;
     default: assert(0);
     }
   }
 }
 
+// Keycode of the key currently holding animation logging open.
+static int g_anim_log_keycode;
+
 static void HandleInput(int keyCode, int keyMod, bool pressed) {
+  // The prompt eats key presses so the game does not also act on them. Releases still pass through,
+  // otherwise a control held before the prompt opened would stay stuck down.
+  if (pressed && DebugGoto_HandleKey(keyCode))
+    return;
+
+  // Match the release by keycode, so letting go of shift before the letter still stops logging.
+  if (!pressed && g_anim_log_keycode != 0 && keyCode == g_anim_log_keycode) {
+    g_anim_log_keycode = 0;
+    DebugLog_SetAnimationHeld(false);
+  }
+
   int j = FindCmdForSdlKey(keyCode, keyMod);
+  if (j == kKeys_LogAnimation && pressed)
+    g_anim_log_keycode = keyCode;
   if (j != 0)
     HandleCommand(j, pressed);
 }

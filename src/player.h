@@ -1,6 +1,9 @@
 #pragma once
 #include "types.h"
 
+// Shift+I. Link takes no damage and nothing knocks him back.
+extern bool g_cheat_invincible;
+
 extern const uint8 kSwimmingTab1[4];
 extern const uint8 kSwimmingTab2[2];
 

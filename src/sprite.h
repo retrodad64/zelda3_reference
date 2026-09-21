@@ -75,6 +75,7 @@ static inline void SetOamPlain(OamEnt *oam, uint8 x, uint8 y, uint8 charnum, uin
 
 extern const uint8 kAbsorptionSfx[15];
 extern const uint8 kSpriteInit_BumpDamage[243];
+extern const uint8 kSpriteInit_Health[243];
 extern const uint16 kSinusLookupTable[256];
 extern const uint8 kThrowableScenery_Flags[9];
 extern const uint8 kWishPond2_OamFlags[76];

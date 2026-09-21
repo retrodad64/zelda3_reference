@@ -34,6 +34,14 @@ enum {
   kKeys_ToggleRenderer,
   kKeys_VolumeUp,
   kKeys_VolumeDown,
+  kKeys_LogTiles,
+  kKeys_LogAnimation,
+  kKeys_GotoScreen,
+  kKeys_CheatInvincible,
+  kKeys_NoMusic,
+  kKeys_ListSprites,
+  kKeys_Screenshot,
+  kKeys_CopyLocation,
   kKeys_Total,
 };
 

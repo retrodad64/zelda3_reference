@@ -7,6 +7,10 @@
 bool ZeldaIsPlayingMusicTrack(uint8 track);
 bool ZeldaIsPlayingMusicTrackWithBug(uint8 track);
 void ZeldaPlayMsuAudioTrack(uint8 track);
+
+// Shift+M. Sound effects use the other two APU ports, so they keep playing.
+extern bool g_cheat_no_music;
+void ZeldaToggleMusic(void);
 bool ZeldaIsMusicPlaying();
 
 void ZeldaEnableMsu(uint8 enable);

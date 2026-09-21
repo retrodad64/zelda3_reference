@@ -135,7 +135,7 @@ static const uint8 kSpriteInit_Flags2[243] = {
   0x82, 0x83, 0x83, 0x81, 0x82, 0x81, 0x82, 0xa0, 0xa1, 0xa3, 0xa1, 0xa1, 0xa1, 0x83, 0x85, 0x83,
   0x83, 0x83, 0x83,
 };
-static const uint8 kSpriteInit_Health[243] = {
+const uint8 kSpriteInit_Health[243] = {
    12,   6, 255,   3,  3,   3,   3,   3,   2,  12,  4, 255,   0,   3,  12,   2,
     0,  20,   4,   4,  0, 255,   0,   2,   3,   8,  0,   0,   0,   0,   0,   0,
     8,   3,   8,   2,  2,   0,   3, 255,   0,   3,  3,   3,   3,   3,   3,   3,
@@ -2722,7 +2722,7 @@ void Sprite_AttemptDamageToLinkWithCollisionCheck(int k) {  // 86f3ca
 }
 
 void Sprite_AttemptDamageToLinkPlusRecoil(int k) {  // 86f3db
-  if (countdown_for_blink | link_disable_sprite_damage)
+  if (countdown_for_blink | link_disable_sprite_damage || g_cheat_invincible)
     return;
   link_incapacitated_timer = 19;
   Sprite_ApplyRecoilToLink(k, 24);
@@ -2810,6 +2810,9 @@ void Sprite_DoHitBoxesFast(int k, SpriteHitBox *hb) {  // 86f645
 }
 
 void Sprite_ApplyRecoilToLink(int k, uint8 vel) {  // 86f688
+  if (g_cheat_invincible)
+    return;
+
   ProjectSpeedRet pt = Sprite_ProjectSpeedTowardsLink(k, vel);
   link_actual_vel_x = pt.x;
   link_actual_vel_y = pt.y;

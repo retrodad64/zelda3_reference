@@ -422,26 +422,37 @@ static uint8 *DebugScene_ItemVar(const char *key) {
     return NULL;
 }
 
+bool DebugScene_SetItem(const char *key, int level) {
+    uint8 *var = DebugScene_ItemVar(key);
+    int    n = 0;
+
+    if (var != NULL) {
+        *var = (uint8)level;
+    } else if (strcmp(key, "pendant_courage") == 0) {
+        link_which_pendants |= level ? 1 : 0;
+    } else if (strcmp(key, "pendant_wisdom") == 0) {
+        link_which_pendants |= level ? 2 : 0;
+    } else if (strcmp(key, "pendant_power") == 0) {
+        link_which_pendants |= level ? 4 : 0;
+    } else if (sscanf(key, "crystal_%d", &n) == 1 && n >= 1 && n <= 7) {
+        link_has_crystals |= level ? kCrystalBits[n - 1] : 0;
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+void DebugScene_ReloadKitGraphicsSoon(void) {
+    g_kit_gfx_countdown = kKitGfxDelay;
+}
+
 static void DebugScene_ApplyKit(void) {
     link_which_pendants = 0;
     link_has_crystals = 0;
 
     for (int i = 0; i < g_scene.item_count; i++) {
-        const SceneItem *it = &g_scene.items[i];
-        uint8           *var = DebugScene_ItemVar(it->key);
-        int              n = 0;
-
-        if (var != NULL) {
-            *var = (uint8)it->level;
-        } else if (strcmp(it->key, "pendant_courage") == 0) {
-            link_which_pendants |= it->level ? 1 : 0;
-        } else if (strcmp(it->key, "pendant_wisdom") == 0) {
-            link_which_pendants |= it->level ? 2 : 0;
-        } else if (strcmp(it->key, "pendant_power") == 0) {
-            link_which_pendants |= it->level ? 4 : 0;
-        } else if (sscanf(it->key, "crystal_%d", &n) == 1 && n >= 1 && n <= 7) {
-            link_has_crystals |= it->level ? kCrystalBits[n - 1] : 0;
-        }
+        DebugScene_SetItem(g_scene.items[i].key, g_scene.items[i].level);
     }
 
     // The bottle that is out is the first one he has.

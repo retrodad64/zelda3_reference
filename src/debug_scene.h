@@ -25,4 +25,13 @@ void DebugScene_Frame(void);
 // Puts the loaded scene down. Call on the overworld; it loads the area it builds on itself.
 void DebugScene_Apply(void);
 
+// Sets one thing in Link's kit by the name the pug demo gives it: an item's byte, a pendant or
+// a crystal. False for a name it does not know. Pendants and crystals are only ever added, so
+// clear link_which_pendants and link_has_crystals first to set them from nothing.
+bool DebugScene_SetItem(const char *key, int level);
+
+// Draws the sword, the shield and the mail again a few frames from now, from their levels,
+// once whatever screen is going up has its own graphics in. Needs DebugScene_Frame each frame.
+void DebugScene_ReloadKitGraphicsSoon(void);
+
 #endif  // ZELDA3_DEBUG_SCENE_H_

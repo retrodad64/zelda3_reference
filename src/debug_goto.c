@@ -33,6 +33,9 @@ static uint8 g_digits[kMaxScreenDigits];
 static int g_digit_count;
 static uint32 g_blink_counter;
 
+// Set by a jump, so the new screen's overlay goes up on the frame after it.
+static bool g_overlays_pending;
+
 // Rows are bottom of byte to left of glyph, matching the digit font in main.c.
 static const uint8 kHexFont[16][kGlyphHeight] = {
     { 0x1c, 0x36, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x36, 0x1c },  // 0
@@ -212,7 +215,35 @@ static void DebugGoto_JumpToPos(uint8 screen, uint16 target_x, uint16 target_y) 
     is_standing_in_doorway = 0;
     Dungeon_ResetTorchBackgroundAndPlayerInner();
 
+    // The overlay on BG1, the rain among them, is left for the next frame. It goes to VRAM the
+    // same way the screen does, through NMI subroutine 4 and the same staging buffers, so doing
+    // both in one frame would lose one of them.
+    g_overlays_pending = true;
+
     printf("goto: screen %02X at %04X,%04X\n", screen, target_x, target_y);
+}
+
+void DebugGoto_Frame(void) {
+    uint8 saved_submodule;
+
+    if (!g_overlays_pending) {
+        return;
+    }
+
+    g_overlays_pending = false;
+
+    // Something after the jump took him off the overworld, so there is no overlay to put up.
+    if (main_module_index != 9 || submodule_index != 0 || player_is_indoors) {
+        return;
+    }
+
+    // What an area change does before it builds the screen. It picks the overlay from the screen
+    // and the story, so the rain comes back before the rescue, and it turns the subscreen on,
+    // which Overworld_SetFixedColAndScroll turned off during the jump. It steps the submodule
+    // too, which is put back.
+    saved_submodule = submodule_index;
+    Overworld_LoadOverlays2();
+    submodule_index = saved_submodule;
 }
 
 void DebugGoto_JumpToSprite(uint8 screen, uint16 sprite_x, uint16 sprite_y) {

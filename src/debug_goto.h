@@ -13,6 +13,9 @@ void DebugGoto_JumpToPoint(uint16 x, uint16 y, bool dark);
 // position the game itself keeps. The screen is used as given, so name a big area by its head.
 void DebugGoto_JumpToSprite(uint8 screen, uint16 sprite_x, uint16 sprite_y);
 
+// Once a frame, after the game's own. Finishes a jump made on an earlier frame.
+void DebugGoto_Frame(void);
+
 void DebugGoto_OpenPrompt(void);
 bool DebugGoto_IsPromptOpen(void);
 

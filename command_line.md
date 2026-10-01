@@ -23,6 +23,7 @@ normally.
 | `--npc-warp <hex>` | a sprite type | The same, named for a harmless sprite |
 | `--boss-warp <hex>` | a sprite type | The same, named for a high health sprite |
 | `--scene <file>` | a path | Rebuilds a scene saved by the pug hero demo's entity sandbox |
+| `--spot <file>` | a path | Goes where F2 in the pug hero demo left Link, with his kit and story |
 | `--help` | nothing | Prints the option list and exits |
 | a bare path | a path | ROM for the reference emulator |
 
@@ -324,6 +325,23 @@ It is one of the options that decide where Link ends up. Like the others it wait
 overworld, so start it from a save that is outdoors; `--skip-intro` starts in Link's house and
 never gets there. The file is read before the window opens, so a scene that will not do stops
 the run with a line saying why.
+
+## --spot
+
+Puts Link where F2 in the pug hero demo remembered him, as he was: the same place outdoors or
+in a room, the same kit, and the same story, rooms and overworld events. The demo writes the
+file to `~/.pug_engine/pug_hero_demo_spot.txt`. `spots.md` has the format and how he gets there.
+
+```
+./zelda3 --spot ~/.pug_engine/pug_hero_demo_spot.txt
+```
+
+The file carries the whole save, so without `--load-save` it starts from a new file on its own,
+the way `--skip-intro` does. With one, the savestate is the machine it starts from and the
+spot's kit and story go over it. It is one of the options that decide where Link ends up, and
+it does not wait for the overworld: from a room it walks out through that room's way out
+first. The file is read before the window opens, so one that will not do stops the run with a
+line saying why.
 
 ## Related
 

@@ -31,6 +31,7 @@
 #include "debug_log.h"
 #include "png_writer.h"
 #include "debug_goto.h"
+#include "debug_spot.h"
 #include "debug_scene.h"
 #include "player.h"
 #include "debug_locate.h"
@@ -592,7 +593,7 @@ static bool g_goto_dark;
 static bool KeyScript_SetupPending(void) {
   return g_load_save_path != NULL || g_skip_intro || g_screen_id >= 0 || g_goto_x >= 0 ||
          g_warp_type >= 0 || g_list_liftables || g_lift_warp != -2 || g_entrance >= 0 ||
-         DebugScene_Pending();
+         DebugScene_Pending() || DebugSpot_Pending();
 }
 
 // Start file one on a brand new save, the way picking an empty slot and naming it does.
@@ -662,6 +663,7 @@ static void PrintUsage(void) {
     "  --boss-warp <hex>      The same, for a high health sprite.",
     "  --lift-warp [<hex>]    Beside a liftable cell. Without a value, any.",
     "  --scene <file>         Rebuild a scene saved by the pug hero entity sandbox.",
+    "  --spot <file>          Go where F2 in the pug hero demo left him, with his kit.",
     "",
     "Listing and dumping",
     "  --list-sprites         Every sprite the overworld data places.",
@@ -854,6 +856,21 @@ int main(int argc, char** argv) {
 
   // --scene: a place built in the pug demo's sandbox. It is read now, so a file that will not
   // do stops the run before the window opens rather than after the save has loaded.
+  // --spot: the spot F2 remembers in the pug demo, with his kit and story. Read now for the same
+  // reason. The spot carries the whole save, so without a savestate it starts from a new file.
+  for (int i = 0; i < argc; i++) {
+    if (strcmp(argv[i], "--spot") == 0) {
+      if (i + 1 >= argc)
+        Die("--spot needs a file");
+      ClaimPositionOption("--spot");
+      if (!DebugSpot_Load(argv[i + 1]))
+        exit(1);
+      memmove(argv + i, argv + i + 2, (argc - i - 2) * sizeof(*argv));
+      argc -= 2;
+      break;
+    }
+  }
+
   for (int i = 0; i < argc; i++) {
     if (strcmp(argv[i], "--scene") == 0) {
       if (i + 1 >= argc)
@@ -1103,6 +1120,10 @@ goto_bad:
   if (argc >= 1 && !g_run_without_emu)
     LoadRom(argv[0]);
 
+  // A spot carries the whole save, so with no savestate to start from it starts from a new file.
+  if (DebugSpot_Pending() && g_load_save_path == NULL)
+    g_skip_intro = true;
+
 #if defined(_WIN32)
   _mkdir("saves");
 #else
@@ -1196,6 +1217,9 @@ goto_bad:
     SDL_LockMutex(g_audio_mutex);
     bool is_replay = ZeldaRunFrame(inputs);
 
+    // Before anything below can jump, so a jump's overlay always waits a frame.
+    DebugGoto_Frame();
+
     // One frame in, the game has initialised itself, which is the first point where dropping
     // it straight into a game takes.
     if (g_load_save_path) {
@@ -1277,6 +1301,7 @@ goto_bad:
       }
     }
 
+    DebugSpot_Frame();
     DebugScene_Frame();
 
     SDL_UnlockMutex(g_audio_mutex);
